@@ -7,8 +7,8 @@ import { trackEvent, trackError } from '../lib/telemetry';
 import type { SavedSession, ChatMessage, ToolCallInfo, PermissionRequest, SessionMode, SlashCommand, ModelInfo, AgentConfig } from '../lib/types';
 import { getTransportKind } from '../lib/types';
 import { AcpClientBridge, createAcpClient } from '../lib/acp-bridge';
+import { GatewayClient, spawnResponseToAgentConfig } from '../lib/gateway';
 import { onAgentStderr, spawnAgent, killAgent } from '../lib/host';
-import { isDesktop } from '../lib/platform';
 import { useConfigStore } from './config';
 import type { SessionNotification, AuthMethod } from '@agentclientprotocol/sdk';
 
@@ -299,6 +299,18 @@ export const useSessionStore = defineStore('session', () => {
     const transportKind = agentConfig
       ? getTransportKind(agentConfig)
       : 'stdio';
+
+    // Gateway agents need a two-phase setup: HTTP spawn first, then WS connect.
+    if (transportKind === 'gateway') {
+      try {
+        await createGatewaySession(agentName, agentConfig, agentConfig?.defaultNodeId ?? 'default', cwd);
+      } finally {
+        isLoading.value = false;
+        isConnecting.value = false;
+      }
+      return;
+    }
+
     const isRemote = transportKind !== 'stdio';
 
     // Reset and start progress tracking
@@ -396,16 +408,12 @@ export const useSessionStore = defineStore('session', () => {
       startupPhase.value = 'connecting';
 
       // Initialize connection
-      // Only Tauri desktop has real filesystem access; mobile and web
-      // cannot fulfil readTextFile / writeTextFile RPCs.
-      const canAccessFs = isDesktop();
-
       const initResponse = await acpClient.initialize({
         protocolVersion: PROTOCOL_VERSION,
         clientCapabilities: {
           fs: {
-            readTextFile: canAccessFs,
-            writeTextFile: canAccessFs,
+            readTextFile: true,
+            writeTextFile: true,
           },
         },
         clientInfo: {
@@ -565,6 +573,121 @@ export const useSessionStore = defineStore('session', () => {
     }
   }
 
+  // Create a session via the Remote Agent Gateway.
+  // This is a two-phase flow:
+  //   1. POST /api/v1/agents/spawn  → get WebSocket endpoint
+  //   2. Connect WebSocketTransport to endpoint → normal ACP initialize
+  async function createGatewaySession(
+    agentName: string,
+    agentConfig: AgentConfig | undefined,
+    nodeId: string,
+    cwd: string
+  ): Promise<void> {
+    startupPhase.value = 'spawning';
+    try {
+      if (!agentConfig || !agentConfig.gatewayUrl || !agentConfig.userToken) {
+        throw new Error(`Gateway agent '${agentName}' missing gatewayUrl or userToken`);
+      }
+
+      const client = new GatewayClient(agentConfig.gatewayUrl, agentConfig.userToken);
+      const spawnResp = await client.spawn({
+        nodeId,
+        directory: cwd,
+        env: agentConfig.env,
+        timeoutMinutes: 60,
+      });
+
+      if (connectionAborted) {
+        await client.destroy(spawnResp.sessionId).catch(() => {});
+        throw new Error('Connection cancelled');
+      }
+
+      startupPhase.value = 'connecting';
+
+      // Convert spawn response to a websocket AgentConfig
+      const wsConfig = spawnResponseToAgentConfig(spawnResp);
+      acpClient = await createAcpClient({ name: agentName, config: wsConfig });
+      acpClient.onSessionUpdate = handleSessionUpdate;
+      acpClient.onTransportClose = (reason) => handleUnexpectedClose(reason);
+
+      watch(
+        () => acpClient?.pendingPermissionRequest.value,
+        (newValue) => {
+          pendingPermission.value = newValue ?? null;
+        },
+        { immediate: true }
+      );
+
+      const initResponse = await acpClient.initialize({
+        protocolVersion: PROTOCOL_VERSION,
+        clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
+        clientInfo: { name: 'acp-ui', title: 'ACP UI', version: appVersion },
+      });
+
+      const supportsLoadSession = initResponse.agentCapabilities?.loadSession ?? false;
+
+      let sessionResponse;
+      try {
+        sessionResponse = await acpClient.newSession({ cwd, mcpServers: [] });
+      } catch (sessionError: unknown) {
+        const errorMessage = sessionError instanceof Error ? sessionError.message : String(sessionError);
+        const isAuthRequired = errorMessage.toLowerCase().includes('authentication required') ||
+                               errorMessage.includes('-32000');
+        if (isAuthRequired && (initResponse.authMethods || []).length > 0) {
+          const selectedMethodId = await promptForAuthMethod(initResponse.authMethods, agentName);
+          if (!selectedMethodId || connectionAborted) {
+            await acpClient.disconnect();
+            throw new Error('Authentication cancelled by user');
+          }
+          await acpClient.authenticate({ methodId: selectedMethodId });
+          sessionResponse = await acpClient.newSession({ cwd, mcpServers: [] });
+        } else {
+          throw sessionError;
+        }
+      }
+
+      const session: SavedSession = {
+        id: crypto.randomUUID(),
+        agentName,
+        sessionId: sessionResponse.sessionId,
+        title: `Session ${new Date().toLocaleString()}`,
+        lastUpdated: Date.now(),
+        cwd,
+        supportsLoadSession,
+      };
+
+      currentSession.value = session;
+      savedSessions.value.push(session);
+      await saveSessionsToStore();
+      isConnected.value = true;
+      messages.value = [];
+      toolCalls.value.clear();
+      trackEvent('SessionCreated', { agentName, success: 'true' });
+
+      if (sessionResponse.modes) {
+        availableModes.value = (sessionResponse.modes.availableModes || []).map(m => ({
+          id: m.id, name: m.name, description: m.description ?? undefined,
+        }));
+        currentModeId.value = sessionResponse.modes.currentModeId || '';
+      }
+      if (sessionResponse.models) {
+        availableModels.value = (sessionResponse.models.availableModels || []).map(m => ({
+          modelId: m.modelId, name: m.name, description: m.description ?? undefined,
+        }));
+        currentModelId.value = sessionResponse.models.currentModelId || '';
+      }
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : String(e);
+      if (acpClient) {
+        try { await acpClient.disconnect(); } catch {}
+        acpClient = null;
+      }
+      trackEvent('SessionCreated', { agentName, success: 'false' });
+      trackError(e instanceof Error ? e : new Error(String(e)));
+      throw e;
+    }
+  }
+
   // Resume existing session
   async function resumeSession(savedSession: SavedSession): Promise<void> {
     isLoading.value = true;
@@ -599,17 +722,13 @@ export const useSessionStore = defineStore('session', () => {
         { immediate: true }
       );
 
-      // Only Tauri desktop has real filesystem access; mobile and web
-      // cannot fulfil readTextFile / writeTextFile RPCs.
-      const canAccessFs = isDesktop();
-
       // Initialize connection
       const initResponse = await acpClient.initialize({
         protocolVersion: PROTOCOL_VERSION,
         clientCapabilities: {
           fs: {
-            readTextFile: canAccessFs,
-            writeTextFile: canAccessFs,
+            readTextFile: true,
+            writeTextFile: true,
           },
         },
         clientInfo: {
@@ -947,6 +1066,7 @@ export const useSessionStore = defineStore('session', () => {
     // Actions
     initStore,
     createSession,
+    createGatewaySession,
     resumeSession,
     sendPrompt,
     cancelOperation,

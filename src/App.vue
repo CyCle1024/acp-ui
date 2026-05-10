@@ -12,7 +12,9 @@ import SettingsView from './components/SettingsView.vue';
 import AuthMethodDialog from './components/AuthMethodDialog.vue';
 import TrafficMonitor from './components/TrafficMonitor.vue';
 import StartupProgress from './components/StartupProgress.vue';
+import GatewaySessionDialog from './components/GatewaySessionDialog.vue';
 import type { SavedSession } from './lib/types';
+import { getTransportKind } from './lib/types';
 
 const configStore = useConfigStore();
 const sessionStore = useSessionStore();
@@ -27,6 +29,7 @@ const showSidebar = ref(true);
 const showSettings = ref(false);
 const showTrafficMonitor = ref(false);
 const showStartupDetails = ref(false);
+const showGatewayDialog = ref(false);
 
 // Reactive flag tracking whether the viewport is narrow enough to show the
 // sidebar as a slide-in drawer (mobile / very narrow desktop windows). Used
@@ -169,6 +172,15 @@ async function handleCwdInput(event: Event) {
 async function handleNewSession() {
   if (!selectedAgent.value) return;
 
+  const agentConfig = configStore.getAgent(selectedAgent.value);
+  const transportKind = agentConfig ? getTransportKind(agentConfig) : 'stdio';
+
+  // Gateway agents show a dedicated spawn dialog (node picker, directory).
+  if (transportKind === 'gateway') {
+    showGatewayDialog.value = true;
+    return;
+  }
+
   // ACP requires an absolute working directory; passing '.' is rejected by
   // most agents. On desktop the folder picker always returns an absolute
   // path, but on mobile the user types it, so validate up-front and surface
@@ -188,6 +200,16 @@ async function handleNewSession() {
     await sessionStore.createSession(selectedAgent.value, cwd);
   } catch (e) {
     console.error('Failed to create session:', e);
+  }
+}
+
+async function handleGatewaySpawn(nodeId: string, directory: string) {
+  showGatewayDialog.value = false;
+  try {
+    const agentConfig = configStore.getAgent(selectedAgent.value);
+    await sessionStore.createGatewaySession(selectedAgent.value, agentConfig, nodeId, directory);
+  } catch (e) {
+    console.error('Failed to create gateway session:', e);
   }
 }
 
@@ -452,6 +474,15 @@ function clearError() {
       :agent-name="pendingAuthAgentName"
       @select="handleAuthMethodSelect"
       @cancel="handleAuthMethodCancel"
+    />
+
+    <!-- Gateway Session Dialog -->
+    <GatewaySessionDialog
+      :visible="showGatewayDialog"
+      :agent-name="selectedAgent"
+      :agent-config="configStore.getAgent(selectedAgent)"
+      @spawn="handleGatewaySpawn"
+      @close="showGatewayDialog = false"
     />
 
     <!-- Settings -->

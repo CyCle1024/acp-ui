@@ -7,7 +7,7 @@
  * - `websocket`: agent listens on `ws://` / `wss://` and speaks ACP over a WebSocket.
  * - `http`: agent listens on `http://` / `https://` and speaks ACP over Streamable HTTP / SSE.
  */
-export type AgentTransportKind = 'stdio' | 'websocket' | 'http';
+export type AgentTransportKind = 'stdio' | 'websocket' | 'http' | 'gateway';
 
 export interface AgentConfig {
   /**
@@ -24,6 +24,12 @@ export interface AgentConfig {
   // ----- remote fields (used when transport != 'stdio') -----
   url?: string;
   headers?: Record<string, string>;
+
+  // ----- gateway fields (used when transport == 'gateway') -----
+  gatewayUrl?: string;
+  userToken?: string;
+  defaultNodeId?: string;
+  defaultDirectory?: string;
 }
 
 export interface AgentsConfig {

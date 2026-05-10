@@ -45,6 +45,11 @@ export async function createTransport(
         headers: config.headers,
       });
     }
+    case 'gateway': {
+      throw new Error(
+        `Gateway transport must be handled by the session store before creating a transport (agent '${agentName}').`
+      );
+    }
     case 'http': {
       throw new Error(
         `HTTP transport is not yet implemented (agent '${agentName}')`
